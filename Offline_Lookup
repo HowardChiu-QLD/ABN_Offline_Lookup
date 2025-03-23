@@ -1,0 +1,182 @@
+import os
+import requests
+import zipfile
+import xml.etree.ElementTree as ET
+import pandas as pd
+import schedule
+import time
+import logging
+from datetime import datetime
+from threading import Timer
+
+# Configure logging
+log_file = "abn_query_system.log"
+logging.basicConfig(level=logging.INFO, filename=log_file, filemode="a", format="%(asctime)s - %(levelname)s - %(message)s")
+
+# Set parameters
+download_urls = [
+    "https://data.gov.au/data/dataset/5bd7fcab-e315-42cb-8daf-50b7efc2027e/resource/0ae4d427-6fa8-4d40-8e76-c6909b5a071b/download/public_split_1_10.zip",
+    "https://data.gov.au/data/dataset/5bd7fcab-e315-42cb-8daf-50b7efc2027e/resource/635fcb95-7864-4509-9fa7-a62a6e32b62d/download/public_split_11_20.zip"
+]
+download_folder = r"C:\Users\raytz\OneDrive - Queensland University of Technology\Desktop\bulk_extracts"
+extract_folder = r"C:\Users\raytz\OneDrive - Queensland University of Technology\Desktop\extracted_data"
+database_file = r"C:\Users\raytz\OneDrive - Queensland University of Technology\Desktop\abn_database.csv"
+
+# Create necessary directories
+os.makedirs(download_folder, exist_ok=True)
+os.makedirs(extract_folder, exist_ok=True)
+
+# Timer to monitor long-running tasks
+class Monitor:
+    def __init__(self, timeout):
+        self.timeout = timeout
+        self.timer = None
+
+    def start(self, callback):
+        self.cancel()
+        self.timer = Timer(self.timeout, callback)
+        self.timer.start()
+
+    def cancel(self):
+        if self.timer is not None:
+            self.timer.cancel()
+
+# Monitor callback
+def monitor_timeout():
+    logging.error("Task is taking too long to complete. Please check the system.")
+    print("Warning: Task is taking too long to complete. Check logs for details.")
+
+monitor = Monitor(timeout=300)  # 5 minutes timeout
+
+# Function to check if all required files are already downloaded
+def files_already_downloaded():
+    for url in download_urls:
+        file_name = os.path.join(download_folder, url.split("/")[-1])
+        if not os.path.exists(file_name):
+            return False
+    return True
+
+# Function to download bulk extract files
+def download_bulk_extract():
+    if files_already_downloaded():
+        print("All files already downloaded. Skipping download step.")
+        logging.info("All files already downloaded. Skipping download step.")
+        return
+
+    logging.info("Starting file download")
+    print(f"Starting file download - {datetime.now()}")
+    for url in download_urls:
+        file_name = os.path.join(download_folder, url.split("/")[-1])
+        if os.path.exists(file_name):
+            print(f"File already exists: {file_name}. Skipping.")
+            logging.info(f"File already exists: {file_name}. Skipping.")
+            continue
+
+        print(f"Downloading: {url}")
+        response = requests.get(url, stream=True)
+        if response.status_code == 200:
+            with open(file_name, "wb") as file:
+                for chunk in response.iter_content(chunk_size=1024):
+                    if chunk:
+                        file.write(chunk)
+            logging.info(f"Downloaded: {file_name}")
+            print(f"Downloaded: {file_name}")
+        else:
+            logging.error(f"Failed to download: {url}, Status code: {response.status_code}")
+            print(f"Failed to download: {url}, Status code: {response.status_code}")
+
+    print("File download completed")
+    logging.info("File download completed")
+
+# Function to extract zip files
+def extract_files():
+    logging.info("Starting file extraction")
+    print(f"Starting file extraction - {datetime.now()}")
+    for file_name in os.listdir(download_folder):
+        if file_name.endswith(".zip"):
+            zip_path = os.path.join(download_folder, file_name)
+            extract_path = os.path.join(extract_folder, os.path.splitext(file_name)[0])
+            if os.path.exists(extract_path):
+                print(f"File already extracted: {file_name}. Skipping.")
+                logging.info(f"File already extracted: {file_name}. Skipping.")
+                continue
+
+            with zipfile.ZipFile(zip_path, "r") as zip_ref:
+                zip_ref.extractall(extract_folder)
+            logging.info(f"Extracted: {file_name}")
+            print(f"Extracted: {file_name}")
+    print("Extraction completed")
+    logging.info("Extraction completed")
+
+# Function to parse XML files and update the database
+def update_database():
+    logging.info("Starting database update")
+    print(f"Starting database update - {datetime.now()}")
+    records = []
+    total_files = len([f for f in os.listdir(extract_folder) if f.endswith(".xml")])
+    processed_files = 0
+
+    for file_name in os.listdir(extract_folder):
+        if file_name.endswith(".xml"):
+            file_path = os.path.join(extract_folder, file_name)
+            logging.info(f"Processing XML file: {file_path}")
+            print(f"Processing XML file: {file_path}")
+            start_time = datetime.now()
+
+            try:
+                context = ET.iterparse(file_path, events=("start", "end"))
+                context = iter(context)
+
+                for event, elem in context:
+                    if event == "end" and elem.tag == "ABR":
+                        record = {
+                            "ABN": elem.findtext("ABN"),
+                            "EntityType": elem.findtext("EntityType/EntityTypeText"),
+                            "State": elem.findtext("BusinessAddress/AddressDetails/State"),
+                            "Postcode": elem.findtext("BusinessAddress/AddressDetails/Postcode"),
+                            "GSTStatus": elem.find("GST").get("status") if elem.find("GST") is not None else None,
+                            "GSTStatusFromDate": elem.find("GST").get("GSTStatusFromDate") if elem.find("GST") is not None else None,
+                        }
+                        records.append(record)
+                        elem.clear()
+
+                processed_files += 1
+                elapsed_time = (datetime.now() - start_time).seconds
+                logging.info(f"Processed {file_name} in {elapsed_time} seconds. {processed_files}/{total_files} completed.")
+                print(f"Processed {file_name} ({processed_files}/{total_files}). Time taken: {elapsed_time}s")
+
+            except Exception as e:
+                logging.error(f"Error processing file {file_path}: {str(e)}")
+                print(f"Error processing file {file_path}: {str(e)}")
+
+    df = pd.DataFrame(records)
+    df.to_csv(database_file, index=False)
+    print("Database update completed")
+    logging.info("Database update completed")
+
+# Function to run the scheduled task
+def scheduled_task():
+    download_bulk_extract()
+    extract_files()
+    update_database()
+
+# Schedule weekly task
+schedule.every().monday.at("02:00").do(scheduled_task)
+
+# Main loop
+if __name__ == "__main__":
+    print("Offline ABN Query System Started")
+    logging.info("Offline ABN Query System Started")
+
+    # Initial database update before scheduling
+    print("Updating database before starting scheduler...")
+    monitor.start(monitor_timeout)  # Start monitoring
+    try:
+        scheduled_task()
+    finally:
+        monitor.cancel()  # Cancel monitoring
+
+    # Start the scheduler
+    while True:
+        schedule.run_pending()
+        time.sleep(1)
